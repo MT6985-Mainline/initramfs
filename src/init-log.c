@@ -8,6 +8,11 @@
  * read back from Android: adb root; mount /dev/block/by-name/cust; cat
  * /mnt/cust/boot-log.txt
  *
+ * COROT r125: the target filesystem is located by its ext4 superblock UUID
+ * (see find_cust below), NOT by the historical hard-coded /dev/sdc80 node -
+ * that node means a different partition once the mainline kernel enumerates
+ * UFS itself, which silently sent every round's log to the wrong place.
+ *
  * ARM64 raw syscalls: mount=40 openat=56 close=57 read=63 write=64
  * fsync=82 mkdirat=34 getdents64=61 nanosleep=101
  */
@@ -174,6 +179,96 @@ static void note(const char *s)
 		write_(g_log, s, slen(s));
 }
 
+/* --- COROT r125: find cust by ext4 UUID, not by a hard-coded node -----
+ *
+ * The mainline test kernel does not enumerate UFS partitions the way the stock
+ * Android kernel does, so the old BOOT_PART (/dev/sdc80) is NOT cust there.
+ * Every round therefore wrote its boot-log.txt somewhere we never looked, and
+ * with the expdb ring also unreliable (LK wipes/rotates it after a watchdog
+ * reset) the whole evening looked like "the kernel printed nothing at all" -
+ * which produced false conclusions about the driver changes under test.
+ *
+ * The one identifier that is identical in both kernels is the filesystem
+ * itself: cust's ext4 superblock UUID. Probe by-name first (if this kernel
+ * provides it), then every /dev/sd* node, and mount only an exact UUID match.
+ * Nothing is ever mounted - or truncated - on a guess.
+ */
+static const unsigned char CUST_UUID[16] = {
+	0xa6, 0x33, 0x3b, 0x1b, 0xa1, 0xa1, 0x4c, 0xf7,
+	0x90, 0xca, 0x83, 0x17, 0x63, 0x4b, 0x7a, 0xec
+};
+
+static int uuid_match(const char *path)
+{
+	static char sb[1024];
+	long fd = openat_(path, O_RDONLY, 0);
+	long n;
+	int i, ok = 1;
+
+	if (fd < 0)
+		return 0;
+	n = pread64_(fd, sb, sizeof(sb), 1024);
+	close_(fd);
+	if (n != (long)sizeof(sb))
+		return 0;
+	/* ext4 superblock: s_magic at +56, s_uuid at +104 */
+	if ((unsigned char)sb[56] != 0x53 || (unsigned char)sb[57] != 0xef)
+		return 0;
+	for (i = 0; i < 16; i++)
+		if ((unsigned char)sb[104 + i] != CUST_UUID[i])
+			ok = 0;
+	return ok;
+}
+
+static const char *find_cust(void)
+{
+	static char name[112];
+	static char buf[4096];
+	long fd, n;
+
+	if (uuid_match("/dev/block/by-name/cust")) {
+		out("corot-log: cust found at /dev/block/by-name/cust (uuid match)\n");
+		return "/dev/block/by-name/cust";
+	}
+	fd = openat_("/dev", O_RDONLY, 0);
+	if (fd < 0) {
+		out("corot-log: cannot open /dev for the uuid scan\n");
+		return 0;
+	}
+	while ((n = getdents64_(fd, buf, sizeof(buf))) > 0) {
+		long off = 0;
+
+		while (off < n) {
+			struct dirent64 *de = (struct dirent64 *)(buf + off);
+			int m;
+			const char *d = de->d_name;
+
+			off += de->d_reclen;
+			if (d[0] != 's' || d[1] != 'd')
+				continue;
+			for (m = 0; m < 5 && d[m]; m++)
+				name[m] = d[m];
+			if (d[m])
+				continue;	/* name too long to be sd*N */
+			name[m++] = 0;
+			/* build "/dev/<name>": shift the name right by 5 */
+			for (; m >= 0; m--)
+				name[m + 5] = name[m];
+			name[0] = '/'; name[1] = 'd'; name[2] = 'e';
+			name[3] = 'v'; name[4] = '/';
+			if (uuid_match(name)) {
+				close_(fd);
+				out("corot-log: cust found at ");
+				out(name);
+				out(" (uuid match)\n");
+				return name;
+			}
+		}
+	}
+	close_(fd);
+	return 0;
+}
+
 /* --- watchdog + display telemetry ---------------------------------- */
 static long g_mem = -1;
 
@@ -209,49 +304,32 @@ static unsigned int rd32(unsigned long pa)
 	return v;
 }
 
+/*
+ * COROT r88: heartbeat only.
+ *
+ * This used to read DSI/MUTEX/OVL/GCE registers through /dev/mem every two
+ * seconds.  Those blocks sit in the MM display power domain: while the DRM is
+ * up that is fine, but as soon as the DRM master fails to bind the domain stays
+ * off, the reads all return 0 and the access stalls the interconnect - a hard
+ * hang with no Oops.  The kernel-side twin of this was disabled in r81; this is
+ * that same fix for the userspace side.
+ *
+ * The watchdog kick, the log stream and the fixed teardown window above are
+ * untouched; only the register reads are gone.
+ */
 static void tele(int n)
 {
-	char line[240];
-	int m = 0, i;
-	static const unsigned long dsi = 0x1400d000UL;
-	static const unsigned long mutex = 0x14001000UL;
-	static const unsigned long ovl = 0x14402000UL;
-	static const unsigned long gce = 0x1e980000UL;
-	static const unsigned long dsi_off[6] = { 0x00, 0x08, 0x0c, 0x10, 0x14, 0x18 };
-	static const unsigned long gth_off[3] = { 0x00, 0x20, 0x24 };
+	char line[24];
+	int m = 0;
 
-	if (g_mem < 0)
-		return;
-	m = 0;
 	line[m++] = 't'; line[m++] = 'e'; line[m++] = 'l'; line[m++] = 'e';
 	line[m++] = ' ';
 	if (n >= 100) line[m++] = '0' + n / 100 % 10;
 	if (n >= 10) line[m++] = '0' + n / 10 % 10;
 	line[m++] = '0' + n % 10;
 	line[m++] = ' ';
-	for (i = 0; i < 6; i++) {
-		line[m++] = '0'; line[m++] = 'x';
-		hex8(line + m, rd32(dsi + dsi_off[i])); m += 8;
-		line[m++] = ' ';
-	}
-	line[m++] = 'm'; line[m++] = 'u'; line[m++] = 'x'; line[m++] = '=';
-	line[m++] = '0'; line[m++] = 'x';
-	hex8(line + m, rd32(mutex + 0x20)); m += 8;
-	line[m++] = ' ';
-	line[m++] = 'o'; line[m++] = 'v'; line[m++] = 'l'; line[m++] = '=';
-	line[m++] = '0'; line[m++] = 'x';
-	hex8(line + m, rd32(ovl + 0x24)); m += 8;
-	for (i = 0; i < 2; i++) {
-		int j;
-		unsigned long th = gce + 0x100 + (i == 0 ? 0 : 3 * 0x80);
-		line[m++] = ' ';
-		line[m++] = 'g'; line[m++] = '0' + i; line[m++] = '=';
-		for (j = 0; j < 3; j++) {
-			line[m++] = '0'; line[m++] = 'x';
-			hex8(line + m, rd32(th + gth_off[j])); m += 8;
-			if (j < 2) line[m++] = ',';
-		}
-	}
+	line[m++] = 'a'; line[m++] = 'l'; line[m++] = 'i'; line[m++] = 'v';
+	line[m++] = 'e';
 	line[m++] = '\n';
 	line[m] = 0;
 	if (g_log >= 0) {
@@ -456,30 +534,33 @@ void _start(void)
 		out("corot-log: watchdog kick armed (0x10007008)\n");
 	dump_cmdline();
 
-	/* wait for UFS block device */
-	for (i = 0; i < 45; i++) {
-		long fd = openat_(BOOT_PART, O_RDONLY, 0);
-		if (fd >= 0) {
-			close_(fd);
-			break;
-		}
-		pause1s(&one);
-	}
-	if (i == 45) {
-		out("corot-log: " BOOT_PART " never appeared\n");
-		list_dir("/dev/block", 's');
-		for (;;)
-			pause1s(&five);
-	}
-	out("corot-log: " BOOT_PART " present\n");
+	/* wait for UFS enumeration, then find cust by ext4 UUID (r125) */
+	{
+		const char *cust;
 
-	if (mount_(BOOT_PART, "/newroot", "ext4", 0, 0) < 0) {
-		out("corot-log: cust ext4 mount FAILED\n");
-		list_dir("/dev/block", 's');
-		for (;;)
-			pause1s(&five);
+		for (i = 0; i < 45; i++) {
+			cust = find_cust();
+			if (cust)
+				break;
+			pause1s(&one);
+		}
+		if (!cust) {
+			out("corot-log: cust NOT FOUND by uuid; sd* nodes seen:\n");
+			list_dir("/dev", 's');
+			out("corot-log: no log target; expdb ring is the only channel\n");
+			for (;;)
+				pause1s(&five);
+		}
+		if (mount_(cust, "/newroot", "ext4", 0, 0) < 0) {
+			out("corot-log: cust ext4 mount FAILED on ");
+			out(cust);
+			out("\n");
+			list_dir("/dev", 's');
+			for (;;)
+				pause1s(&five);
+		}
+		out("corot-log: cust mounted rw\n");
 	}
-	out("corot-log: cust mounted rw\n");
 
 	g_log = openat_(LOG_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
 	if (g_log < 0) {
