@@ -8,8 +8,18 @@ MediaTek MT6985) mainline bring-up.
 The board has no usable serial console and a test kernel can hang hard enough
 to take the whole SoC down with it, which is exactly when the log matters
 most. So instead of pivoting into a rootfs, this `init` mounts the phone's
-`cust` partition (ext4, `/dev/block/sdc80`) read-write and streams
-`/dev/kmsg` into `/newroot/boot-log.txt`, `fsync`-ing after every chunk.
+`cust` partition (ext4) read-write and streams `/dev/kmsg` into
+`/newroot/boot-log.txt`, `fsync`-ing after every chunk.
+
+`cust` is found by its **ext4 superblock UUID**, not by a device node: on the
+stock Android kernel it is `/dev/sdc80`, but the mainline test kernel enumerates
+UFS differently, so a hard-coded node silently sent every bring-up round's log
+somewhere else - which made those rounds look like "the kernel printed nothing"
+and produced conclusions from runs that had recorded no data at all.  The
+catcher now probes `/dev/block/by-name/cust` first and then every `/dev/sd*`
+node, matches magic `0xEF53` at superblock +56 and the UUID
+`a6333b1b-a1a1-4cf7-90ca-8317634b7aec` (label `debian-cust`), and mounts only an
+exact match - nothing is ever mounted, or `O_TRUNC`'d, on a guess.
 Whatever happens afterwards — hang, panic, watchdog reset — the tail is
 already on flash and can be read back from Android.
 
@@ -25,9 +35,11 @@ raw ARM64 syscalls only (`mount` 40, `openat` 56, `read` 63, `write` 64,
 2. Open `/dev/kmsg` read-write. If `/dev/mem` is available, arm the watchdog
    kick (`0x1c007008`, key `0x1971`) so a WDT reset cannot cut the capture
    short.
-3. Wait up to 45 s for the UFS block device to appear, then mount `cust`
+3. Wait up to 45 s for `cust` to be identified by UUID (see above), mount it
    ext4 at `/newroot` and open `/newroot/boot-log.txt`
-   (`O_CREAT|O_TRUNC|O_APPEND`).
+   (`O_CREAT|O_TRUNC|O_APPEND`).  The successful match is logged, so the log
+   itself records where it went:
+   `corot-log: cust found at /dev/block/by-name/cust (uuid match)`.
 4. Optionally mirror the same stream to `/dev/ttyGS0` when USB gadget serial
    comes up.
 5. Dump one-shot context: `/proc/cmdline`, pstore (`/sys/fs/pstore/*`),
@@ -58,6 +70,7 @@ transition (fastboot/adb appearing) instead.
 | `prebuilt/initramfs.cpio.lz4` | ready-made ramdisk (6 KiB) |
 | `scripts/build_log_initramfs.sh` | the build actually used: compiles `init-log.c`, makes the cpio, lz4-compresses it, then repacks boot/init_boot |
 | `scripts/rebuild_init_log.sh` | rebuild only the ramdisk |
+| `scripts/build_channel.sh` | compile `init-log.c`, pack the cpio + lz4 and drop it into the kernel pack directory |
 | `scripts/build_alpine_initramfs.sh`, `scripts/build_debian_initramfs.sh` | alternate rootfs-based ramdisks |
 | `scripts/read_cust_log.sh`, `scripts/extract_cust.sh` | pull `boot-log.txt` back from Android |
 | `scripts/patch_init_log.py`, `patch_init_log_reboot.py`, `patch_initlog.py` | in-place patch helpers used while developing it |
