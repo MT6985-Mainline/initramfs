@@ -1,0 +1,23 @@
+{
+  "tag": "r360",
+  "kernel_release": "7.2.7-corot-r360+ #13",
+  "sources": {
+    "init-log.c": "da31d12df6b72bab7eeec1354682500ebefd27563576abaf0123026eba8caa2d",
+    "fb-test.c": "de9b521857a87984c1e4ab2294e5d4298cec81b682099d12341b21eecbea7c80"
+  },
+  "files": {
+    "init": {
+      "bytes": 69472,
+      "sha256": "788381a307cb18344b268e8b529dee14c26269214c670bf9ee549de6a7ae83df"
+    },
+    "initramfs.cpio": {
+      "bytes": 70292,
+      "sha256": "009e355e8d711eca743a1789cde5fe44c3e7679f7f76b065361a769ebbce4e8b"
+    },
+    "initramfs.cpio.lz4": {
+      "bytes": 10786,
+      "sha256": "f254c02bf94b1ba4628826e0539f687e53cbbc5ed6d6441d6d93c1e5ce206bc7"
+    }
+  },
+  "hardware_status": "Linux console visible with bottom corruption; continuous updates remain unverified"
+}
