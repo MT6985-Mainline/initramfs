@@ -1,0 +1,19 @@
+{
+  "tag": "r360",
+  "exact_ramdisk_rebuild": true,
+  "public_helper_copies": 9,
+  "python_syntax": "pass",
+  "shell_entrypoints": "pass",
+  "kernel_selected_diff_check": "pass",
+  "initramfs_diff_check": "pass",
+  "kernel_head": "92cfad231c05aef6d004cfdd1b6a35c0588178ba",
+  "kernel_commits": 14,
+  "first_frame_generator_test": {
+    "source": "linux-native/drivers/gpu/drm/mediatek/mediatek_v2/mtk_drm_crtc.c",
+    "source_sha256": "56a7d130507fe732698e98f0b76621c5d79565522b193f2f7a5b1c933e67f2ad",
+    "helpers_sha256": "81edb7637897a978b0426c66fe8ef35df75994ff96343b509509c59c860a2675",
+    "returncode": 0,
+    "output": "PASS: 33643 scenarios, 13443505 assertions\n",
+    "scope": "Actual first-frame generators and native encoder/read/assign/conditional-jump functions; modeled eager buffer relocation and command execution, all 480 instruction alignments. No hardware or device operations."
+  }
+}

@@ -1,113 +1,105 @@
-# mt6985-7.2-initramfs-corot
+# Corot MT6985 log and display-test initramfs
 
-The log-catcher initramfs used for the corot (Xiaomi Redmi K60 Ultra,
-MediaTek MT6985) mainline bring-up.
+This initramfs records the Redmi K60 Ultra mainline kernel log and exercises the
+complete MiCode DRM v2 / mi_disp / M12 display port. The current checkpoint is
+**r360**: Linux console content appears on the panel, with a noisy bottom band.
+Continuing full-screen updates are not yet verified. See
+[the r360 hardware checkpoint](docs/r360-display-progress.md).
 
-## Why it exists
+The authorized test target is **UGEEOVYX4TZ9EE45**, on **slot a**. The test helper
+checks the device identity, slot, backup hashes and image hashes before flashing
+only `boot_a` and `init_boot_a`. The original Android images are backed up locally
+and verified after restoration.
 
-The board has no usable serial console and a test kernel can hang hard enough
-to take the whole SoC down with it, which is exactly when the log matters
-most. So instead of pivoting into a rootfs, this `init` mounts the phone's
-`cust` partition (ext4) read-write and streams `/dev/kmsg` into
-`/newroot/boot-log.txt`, `fsync`-ing after every chunk.
+## Capture and display test
 
-`cust` is found by its **ext4 superblock UUID**, not by a device node: on the
-stock Android kernel it is `/dev/sdc80`, but the mainline test kernel enumerates
-UFS differently, so a hard-coded node silently sent every bring-up round's log
-somewhere else - which made those rounds look like "the kernel printed nothing"
-and produced conclusions from runs that had recorded no data at all.  The
-catcher now probes `/dev/block/by-name/cust` first and then every `/dev/sd*`
-node, matches magic `0xEF53` at superblock +56 and the UUID
-`a6333b1b-a1a1-4cf7-90ca-8317634b7aec` (label `debian-cust`), and mounts only an
-exact match - nothing is ever mounted, or `O_TRUNC`'d, on a guess.
-Whatever happens afterwards — hang, panic, watchdog reset — the tail is
-already on flash and can be read back from Android.
+`src/init-log.c` and `src/fb-test.c` form a static, freestanding ARM64 executable
+using raw system calls. It mounts devtmpfs, proc, sysfs and debugfs, reads
+`/dev/kmsg`, and locates the log filesystem by its ext4 UUID
+`a6333b1b-a1a1-4cf7-90ca-8317634b7aec`. It mounts only an exact match and writes
+`/newroot/boot-log.txt` with regular `fsync` calls.
 
-It is a single freestanding C file: no libc, no busybox, no dynamic linking,
-raw ARM64 syscalls only (`mount` 40, `openat` 56, `read` 63, `write` 64,
-`fsync` 82, `mkdirat` 34, `nanosleep` 101), statically linked, ~10 KiB.
+The capture owns the identified MT6985 watchdog through its real device
+interface. Its sparse RGU mapping verifies the bootloader reboot reason. A
+monotonic 120-second deadline stops feeds and requests a reboot to fastboot,
+including while register dumps keep the log reader busy. A kernel shutdown
+fault can still prevent that transition; r360 required manual fastboot entry
+and the guarded `--restore-only` procedure.
 
-## What it does
+The display test accepts only a native `mediatekdrmfb` framebuffer at
+1220 x 2712 with a valid pitch, length and pixel layout. It detaches the fb
+console, writes red/green/blue/white quadrants, and advances a white vertical
+bar every five seconds. A successful framebuffer write proves the CPU wrote
+that buffer; physical display observations and hardware completion logs are
+needed to establish scanout. Three bounded pin snapshots record the panel,
+reset and TE pin state.
 
-`_start()` in `src/init-log.c`:
+## Build the ramdisk
 
-1. `mkdir` + mount `devtmpfs` on `/dev`, `proc` on `/proc`, `sysfs` on `/sys`.
-2. Open `/dev/kmsg` read-write. If `/dev/mem` is available, arm the watchdog
-   kick (`0x1c007008`, key `0x1971`) so a WDT reset cannot cut the capture
-   short.
-3. Wait up to 45 s for `cust` to be identified by UUID (see above), mount it
-   ext4 at `/newroot` and open `/newroot/boot-log.txt`
-   (`O_CREAT|O_TRUNC|O_APPEND`).  The successful match is logged, so the log
-   itself records where it went:
-   `corot-log: cust found at /dev/block/by-name/cust (uuid match)`.
-4. Optionally mirror the same stream to `/dev/ttyGS0` when USB gadget serial
-   comes up.
-5. Dump one-shot context: `/proc/cmdline`, pstore (`/sys/fs/pstore/*`),
-   a listing of `/dev/block`, a framebuffer scan, and the UDC state.
-6. Loop forever: read `/dev/kmsg`, append to the log, `fsync`, and every
-   couple of seconds emit a telemetry line plus a heartbeat
-   (`---- corot-hb N alive ==`) so a truncated log still shows how far it got.
-7. After a fixed telemetry window it reboots to the bootloader, which the
-   flash scripts use as the "test finished" signal.
-
-### A note on the window length
-
-The window is `h / 2 >= 90` telemetry ticks, but `h` only advances on loop
-iterations where `/dev/kmsg` had nothing to read. A kernel that is spewing
-display register dumps keeps the loop busy and the wall-clock window stretches
-accordingly — observed end-to-end test windows in this project ranged from
-~140 s to ~470 s. Do not treat the window length as a fixed number; detect the
-transition (fastboot/adb appearing) instead.
-
-## Files
-
-| Path | What |
-|---|---|
-| `src/init-log.c` | the log-catcher, current version (552 lines) |
-| `src/init.c` | the earlier minimal init (no log capture) |
-| `src/init-debian.c` | variant that pivots into a Debian rootfs |
-| `src/Makefile` | small standalone build for `init.c` |
-| `prebuilt/initramfs.cpio.lz4` | ready-made ramdisk (6 KiB) |
-| `scripts/build_log_initramfs.sh` | the build actually used: compiles `init-log.c`, makes the cpio, lz4-compresses it, then repacks boot/init_boot |
-| `scripts/rebuild_init_log.sh` | rebuild only the ramdisk |
-| `scripts/build_channel.sh` | compile `init-log.c`, pack the cpio + lz4 and drop it into the kernel pack directory |
-| `scripts/build_alpine_initramfs.sh`, `scripts/build_debian_initramfs.sh` | alternate rootfs-based ramdisks |
-| `scripts/read_cust_log.sh`, `scripts/extract_cust.sh` | pull `boot-log.txt` back from Android |
-| `scripts/patch_init_log.py`, `patch_init_log_reboot.py`, `patch_initlog.py` | in-place patch helpers used while developing it |
-
-## Building
+Dependencies: Python 3, `aarch64-linux-gnu-gcc` and `lz4`. All generated files
+and compiler scratch stay in the selected output directory.
 
 ```sh
-aarch64-linux-gnu-gcc -nostdlib -static -fno-stack-protector -fno-builtin \
-    -ffreestanding -Os -Wl,-e,_start -o root/init src/init-log.c
-(cd root && find . -print | cpio -o -H newc > ../initramfs.cpio)
-lz4 -l -9 -f initramfs.cpio initramfs.cpio.lz4
+python3 tools/build-log-ramdisk.py --out out/log-ramdisk
 ```
 
-The ramdisk is only a few KiB; it goes into `init_boot_a` and `init_boot_b`
-(padded to the partition's 8 MiB), while the kernel goes into `boot_ab`.
-`vendor_boot` is never touched.
+The old `scripts/build_channel.sh`, `scripts/rebuild_init_log.sh` and
+`scripts/build_log_initramfs.sh` entry points call this builder and accept the
+same options. They compile both current sources and no longer depend on old
+host paths. `src/Makefile` retains the earlier minimal `src/init.c` build.
+
+`prebuilt/initramfs.cpio.lz4` is the exact ramdisk tested with r360.
+[Its manifest](prebuilt/r360-manifest.json) records the sources, init and archive
+hashes. The standalone builder verifies that decompression reproduces the
+entire deterministic cpio archive.
+
+## Kernel build and guarded test workflow
+
+The `bringup/` directory stores the build, pack, backup, test and evidence
+helpers used in this workspace. Install them into a sibling workspace
+`scripts/` directory: their paths are resolved relative to that directory.
+The workspace layout is `linux-native/`, `initramfs/`, `scripts/`, `out/`,
+`images/`, `backups/`, `board/` and `evidence/`.
+
+From the workspace containing this repository:
 
 ```sh
-fastboot -s $SERIAL flash boot_ab     corot-boot.img
-fastboot -s $SERIAL flash init_boot_a corot-init_boot.img
-fastboot -s $SERIAL flash init_boot_b corot-init_boot.img
+mkdir -p scripts
+cp initramfs/bringup/*.py scripts/
+python3 scripts/backup-slot-a.py --serial UGEEOVYX4TZ9EE45
+python3 scripts/build-corot.py --source linux-native --name r360 --release r360 --target all --jobs 8
+python3 scripts/pack-corot.py --build out/r360 --tag r360
 ```
 
-## Reading the log back
+The kernel source is
+[MT6985-Mainline/linux, 7.2-mt6985-xiaomi-corot](https://github.com/MT6985-Mainline/linux/tree/7.2-mt6985-xiaomi-corot).
+The build checks the complete provider selection and the genuine MT6985 MML
+topology/initcall. Packing checks the matching release and marker, the exact
+embedded DTB, legacy-LZ4 payloads and partition sizes. New test tags require a
+matching source marker and `corot_test` DT tag.
 
-From Android with root:
+Before a test, replace the backup path below with the directory created for the
+connected target. The helper verifies `corot`, serial, current slot a and both
+original partition hashes, enables `fastboot oem p2u on`, tests the images and
+then restores the original slot-a images.
 
 ```sh
-mkdir -p /data/local/tmp/cust
-mount -t ext4 -o ro,noload /dev/block/sdc80 /data/local/tmp/cust
-cat /data/local/tmp/cust/boot-log.txt
-umount /data/local/tmp/cust
+python3 scripts/test-slot-a.py --images images/r360 --backup backups/slot-a-20261114T075949Z
+python3 scripts/collect-crash.py --serial UGEEOVYX4TZ9EE45 --tag after-r360
+python3 scripts/preserve-corot-build.py --build out/r360 --tag r360
 ```
 
-`scripts/read_cust_log.sh` does exactly this over `adb`.
+If the tested kernel does not return to fastboot, enter fastboot manually on
+this K60 Ultra, then run:
 
-**Always check the kernel banner in the captured log** — it contains
-`dirty #NNN` with the build counter. A log whose counter did not advance is a
-stale file from a previous boot, and several wrong conclusions in this project
-came from reading one.
+```sh
+python3 scripts/test-slot-a.py --restore-only --backup backups/slot-a-20261114T075949Z
+```
+
+The collector reads expdb, the pstore partition, ramoops files and the
+UUID-identified cust log from restored Android. It uses
+`/data/local/corot-cust-read` as a read-only mountpoint. Raw dumps, stock boot
+images and local debug builds remain in the workspace.
+
+Always identify the unique kernel release/build counter and test tag before
+interpreting a log. Persistent expdb can retain earlier boot failures.
