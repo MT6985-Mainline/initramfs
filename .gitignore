@@ -1,0 +1,9 @@
+/out/
+/root/
+/initramfs.cpio
+/initramfs.cpio.lz4
+/src/root/
+/src/initramfs.cpio
+/src/initramfs.cpio.lz4
+__pycache__/
+*.py[cod]
