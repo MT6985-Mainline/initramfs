@@ -16,6 +16,7 @@
  * ARM64 raw syscalls: mount=40 openat=56 close=57 read=63 write=64
  * fsync=82 mkdirat=34 getdents64=61 nanosleep=101
  */
+#include <linux/watchdog.h>
 #define AT_FDCWD -100
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -31,6 +32,11 @@
 #define LOG_PATH "/newroot/boot-log.txt"
 
 struct timespec { long tv_sec; long tv_nsec; };
+static struct timespec capture_deadline;
+static int capture_deadline_ready;
+static int capture_stopped;
+static long capture_watchdog = -1;
+void corot_fb_test_step(void (*log)(const char *));
 
 struct dirent64 {
 	unsigned long long d_ino;
@@ -272,22 +278,157 @@ static const char *find_cust(void)
 /* --- watchdog + display telemetry ---------------------------------- */
 static long g_mem = -1;
 
-#define WDT_RESTART_PA 0x1c007008UL
+#define WDT_RGU_PA 0x1c007000UL
+#define WDT_RGU_MAP_SIZE 4096UL
+#define WDT_RESTART_OFFSET 0x08UL
+#define WDT_BOOTMODE_OFFSET 0x24UL
 #define WDT_KEY 0x1971U
+static volatile unsigned int *capture_rgu;
+
+/* ARM64 read/write on /dev/mem accept mapped DRAM only. Use mmap for the
+ * one verified RGU MMIO page. mmap=222 has six arguments; x5 is a byte
+ * offset, not a page number and not an omitted register in ksys().
+ */
+static long map_capture_rgu(void)
+{
+	register long x0 asm("x0") = 0;
+	register long x1 asm("x1") = WDT_RGU_MAP_SIZE;
+	register long x2 asm("x2") = 3; /* PROT_READ | PROT_WRITE */
+	register long x3 asm("x3") = 1; /* MAP_SHARED */
+	register long x4 asm("x4") = g_mem;
+	register long x5 asm("x5") = WDT_RGU_PA;
+	register long x8 asm("x8") = 222;
+
+	asm volatile("svc 0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3),
+		     "r"(x4), "r"(x5), "r"(x8) : "memory");
+	return x0;
+}
+
+static void capture_rgu_sync(void)
+{
+	asm volatile("dsb sy" ::: "memory");
+}
+
+static int is_mtk_watchdog(const char *name)
+{
+	static const char expected[] = "mtk-wdt";
+	int i;
+	for (i = 0; expected[i]; i++)
+		if (name[i] != expected[i])
+			return 0;
+	return name[i] == '\n' || name[i] == 0;
+}
+
+static void arm_capture_watchdog(void)
+{
+	char identity_path[] = "/sys/class/watchdog/watchdog0/identity";
+	char device_path[] = "/dev/watchdog0";
+	char identity[32];
+	struct watchdog_info info;
+	unsigned int mode, readback;
+	long fd, n, mapping;
+	int i, timeout = 20;
+
+	/* Stock corot reboot-mode: NONRST_REG2 low nibble 3 enters fastboot. */
+	if (g_mem < 0) {
+		out("corot-log: cannot map MT6985 RGU: /dev/mem unavailable\n");
+		return;
+	}
+	mapping = map_capture_rgu();
+	if (mapping < 0) {
+		static char error[] = "corot-log: RGU mmap failed ret=0x00000000\n";
+
+		hex8(error + sizeof("corot-log: RGU mmap failed ret=0x") - 1,
+		     (unsigned long)mapping);
+		out(error);
+		return;
+	}
+	capture_rgu = (volatile unsigned int *)mapping;
+	mode = capture_rgu[WDT_BOOTMODE_OFFSET / sizeof(*capture_rgu)];
+	capture_rgu[WDT_BOOTMODE_OFFSET / sizeof(*capture_rgu)] = (mode & ~0xfU) | 3U;
+	capture_rgu_sync();
+	readback = capture_rgu[WDT_BOOTMODE_OFFSET / sizeof(*capture_rgu)];
+	if ((readback & 0xfU) != 3U) {
+		static char error[] = "corot-log: RGU bootloader reason readback failed value=0x00000000\n";
+
+		hex8(error + sizeof("corot-log: RGU bootloader reason readback failed value=0x") - 1,
+		     readback);
+		out(error);
+		ksys(215, mapping, WDT_RGU_MAP_SIZE, 0, 0, 0); /* munmap */
+		capture_rgu = 0;
+		return;
+	}
+	out("corot-log: mapped MT6985 RGU; bootloader reset reason verified\n");
+	for (i = 0; i < 4; i++) {
+		identity_path[sizeof("/sys/class/watchdog/watchdog") - 1] = '0' + i;
+		fd = openat_(identity_path, O_RDONLY, 0);
+		if (fd < 0)
+			continue;
+		n = read_(fd, identity, sizeof(identity) - 1);
+		close_(fd);
+		if (n <= 0)
+			continue;
+		identity[n] = 0;
+		if (!is_mtk_watchdog(identity))
+			continue;
+		device_path[sizeof("/dev/watchdog") - 1] = '0' + i;
+		fd = openat_(device_path, 2, 0);
+		if (fd < 0)
+			continue;
+		if (ksys(29, fd, WDIOC_GETSUPPORT, (long)&info, 0, 0) < 0 ||
+		    !is_mtk_watchdog((char *)info.identity)) {
+			write_(fd, "V", 1);
+			close_(fd);
+			continue;
+		}
+		capture_watchdog = fd;
+		if (ksys(29, fd, WDIOC_SETTIMEOUT, (long)&timeout, 0, 0) < 0)
+			out("corot-log: owned MT6985 watchdog; default timeout retained\n");
+		else
+			out("corot-log: owned MT6985 watchdog with 20s timeout; bootloader reset armed\n");
+		return;
+	}
+	out("corot-log: MT6985 watchdog fd unavailable; mapped RGU fallback active\n");
+}
 
 /* reboot(LINUX_REBOOT_CMD_RESTART2, "bootloader") */
 static void reboot_bootloader(void)
 {
 	static const char arg[] = "bootloader";
-	ksys(142, (long)0xfee1deadUL, (long)0x28121969UL, (long)0xa932fb52UL,
-	     (long)arg, 0);
+	capture_stopped = 1;
+	long ret = ksys(142, (long)0xfee1deadUL, (long)0x28121969UL,
+			(long)0xa1b2c3d4UL, (long)arg, 0);
+	if (ret < 0)
+		note("corot-log: bootloader reboot syscall failed; will retry\n");
 }
 
 static void wdt_kick(void)
 {
 	unsigned int v = WDT_KEY;
-	if (g_mem >= 0)
-		pwrite64_(g_mem, &v, 4, (long)WDT_RESTART_PA);
+	struct timespec now;
+
+	if (capture_stopped) {
+		reboot_bootloader();
+		return;
+	}
+	/* Bound the entire capture, including UFS/log-target failure paths. */
+	if (capture_deadline_ready &&
+	    !ksys(113, 1, (long)&now, 0, 0, 0) &&
+	    now.tv_sec >= capture_deadline.tv_sec) {
+		/* Stop feeding before any potentially blocking log sync. */
+		capture_stopped = 1;
+		note("corot-log: monotonic 120s window done, reboot to bootloader\n");
+		if (g_log >= 0)
+			fsync_(g_log);
+		reboot_bootloader();
+		return;
+	}
+	if (capture_watchdog >= 0)
+		write_(capture_watchdog, ".", 1);
+	else if (capture_rgu) {
+		capture_rgu[WDT_RESTART_OFFSET / sizeof(*capture_rgu)] = v;
+		capture_rgu_sync();
+	}
 }
 
 /* sleep one second, kicking the watchdog so bring-up kernels survive */
@@ -515,6 +656,11 @@ void _start(void)
 	long kmsg_rd;
 	int i, hb = 0;
 
+	if (!ksys(113, 1, (long)&capture_deadline, 0, 0, 0)) {
+		capture_deadline.tv_sec += 120;
+		capture_deadline_ready = 1;
+	}
+
 	mkdirat_("/dev", 0755);
 	mkdirat_("/proc", 0755);
 	mkdirat_("/sys", 0755);
@@ -522,6 +668,8 @@ void _start(void)
 	mount_("devtmpfs", "/dev", "devtmpfs", MS_NOSUID | MS_NOEXEC, "mode=0755");
 	mount_("proc", "/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_RELATIME, 0);
 	mount_("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_RELATIME, 0);
+	if (mount_("debugfs", "/sys/kernel/debug", "debugfs", MS_NOSUID | MS_NOEXEC, 0) < 0)
+		out("corot-log: debugfs diagnostics unavailable\n");
 
 	g_kmsg_w = openat_("/dev/kmsg", O_WRONLY | O_APPEND, 0);
 	kmsg_rd = openat_("/dev/kmsg", O_RDONLY | O_NONBLOCK, 0);
@@ -529,9 +677,8 @@ void _start(void)
 	out("corot-log: initramfs log-catcher started\n");
 	g_mem = openat_("/dev/mem", 2 /* O_RDWR */, 0);
 	if (g_mem < 0)
-		out("corot-log: /dev/mem unavailable; no watchdog kick\n");
-	else
-		out("corot-log: watchdog kick armed (0x10007008)\n");
+		out("corot-log: /dev/mem unavailable; no RGU mapping\n");
+	arm_capture_watchdog();
 	dump_cmdline();
 
 	/* wait for UFS enumeration, then find cust by ext4 UUID (r125) */
@@ -583,6 +730,8 @@ void _start(void)
 
 	/* drain backlog, then stream forever with heartbeats */
 	for (;;) {
+		wdt_kick();
+		corot_fb_test_step(note);
 		long n = read_(kmsg_rd, kbuf, sizeof(kbuf));
 		if (n > 0) {
 			write_(g_log, kbuf, n);
