@@ -406,6 +406,15 @@ static void report_smi_state(void (*log)(const char *), unsigned long seconds)
 	report_smi_iommu(log, seconds);
 }
 
+void corot_smi_snapshot(void (*log)(const char *))
+{
+	struct fb_test_time now;
+
+	if (fb_sys(113, 1, (long)&now, 0, 0))
+		return;
+	report_smi_state(log, now.sec);
+}
+
 static void detach_fb_console(void (*log)(const char *))
 {
 	char path[] = "/sys/class/vtconsole/vtcon0/name";

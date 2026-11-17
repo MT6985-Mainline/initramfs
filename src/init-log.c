@@ -37,6 +37,7 @@ static int capture_deadline_ready;
 static int capture_stopped;
 static long capture_watchdog = -1;
 void corot_fb_test_step(void (*log)(const char *));
+void corot_smi_snapshot(void (*log)(const char *));
 
 struct dirent64 {
 	unsigned long long d_ino;
@@ -679,6 +680,8 @@ void _start(void)
 	if (g_mem < 0)
 		out("corot-log: /dev/mem unavailable; no RGU mapping\n");
 	arm_capture_watchdog();
+	/* Sample SMI/IOMMU state before the first display frame and fb-test loop. */
+	corot_smi_snapshot(out);
 	dump_cmdline();
 
 	/* wait for UFS enumeration, then find cust by ext4 UUID (r125) */
