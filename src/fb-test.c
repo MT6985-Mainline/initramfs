@@ -170,6 +170,242 @@ static void report_display_pins(void (*log)(const char *), unsigned long seconds
 	fb_sys(57, fd, 0, 0, 0);
 }
 
+/* --- bounded SMI/IOMMU port-state probe ---------------------------- */
+#define COROT_SMI_LARB_PORTS 9
+static long smi_mem_fd = -1;
+static volatile unsigned int *smi_larb[4];
+static volatile unsigned int *smi_common;
+static volatile unsigned int *smi_subcomm;
+static volatile unsigned int *smi_iommu;
+static int smi_probe_initialized;
+
+static char *append_text(char *p, const char *s)
+{
+	while (*s)
+		*p++ = *s++;
+	return p;
+}
+
+static char *append_hex32(char *p, unsigned int value)
+{
+	static const char digits[] = "0123456789abcdef";
+	int shift;
+
+	for (shift = 28; shift >= 0; shift -= 4)
+		*p++ = digits[(value >> shift) & 0xf];
+	return p;
+}
+
+static long map_smi_page(unsigned long pa)
+{
+	register long x0 asm("x0") = 0;
+	register long x1 asm("x1") = 4096;
+	register long x2 asm("x2") = 1; /* PROT_READ */
+	register long x3 asm("x3") = 1; /* MAP_SHARED */
+	register long x4 asm("x4") = smi_mem_fd;
+	register long x5 asm("x5") = pa;
+	register long x8 asm("x8") = 222;
+
+	asm volatile("svc 0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3),
+		     "r"(x4), "r"(x5), "r"(x8) : "memory");
+	return x0;
+}
+
+static int is_active_state(const char *s)
+{
+	return s[0] == 'a' && s[1] == 'c' && s[2] == 't' && s[3] == 'i' &&
+	       s[4] == 'v' && s[5] == 'e' && (s[6] == '\n' || s[6] == 0);
+}
+
+static int iommu_runtime_active(void)
+{
+	char buffer[32];
+	long fd, n;
+
+	fd = fb_sys(56, -100,
+		(long)"/sys/devices/platform/1e802000.iommu/power/runtime_status",
+		0, 0);
+	if (fd < 0)
+		return -1;
+	n = fb_sys(63, fd, (long)buffer, sizeof(buffer) - 1, 0);
+	fb_sys(57, fd, 0, 0, 0);
+	if (n <= 0)
+		return -1;
+	buffer[n] = 0;
+	return is_active_state(buffer);
+}
+
+static void log_map_failure(void (*log)(const char *), unsigned long pa, long ret)
+{
+	char line[128], *p = line;
+
+	p = append_text(p, "corot-smi: mmap failed pa=0x");
+	p = append_hex32(p, (unsigned int)pa);
+	p = append_text(p, " ret=0x");
+	p = append_hex32(p, (unsigned int)ret);
+	*p++ = '\n';
+	*p = 0;
+	log(line);
+}
+
+static void report_smi_larb(void (*log)(const char *), unsigned long seconds,
+			    const char *name, volatile unsigned int *base)
+{
+	static const unsigned int key_ports[] = {1, 2, 4, 5, 6};
+	char line[320], *p;
+	unsigned int i, port, raw, ostd;
+
+	if (!base)
+		return;
+	p = line;
+	p = append_text(p, "corot-smi: snap=");
+	p = append_number(p, seconds);
+	p = append_text(p, "s ");
+	p = append_text(p, name);
+	p = append_text(p, " thr=0x");
+	p = append_hex32(p, base[0x024 / 4]);
+	p = append_text(p, " sw=0x");
+	p = append_hex32(p, base[0x040 / 4]);
+	p = append_text(p, " ports=");
+	for (i = 0; i < COROT_SMI_LARB_PORTS; i++) {
+		p = append_hex32(p, base[(0x380 + i * 4) / 4]);
+		*p++ = ' ';
+	}
+	*p = 0;
+	log(line);
+
+	p = line;
+	p = append_text(p, "corot-smi: snap=");
+	p = append_number(p, seconds);
+	p = append_text(p, "s ");
+	p = append_text(p, name);
+	p = append_text(p, " key=");
+	for (i = 0; i < sizeof(key_ports) / sizeof(key_ports[0]); i++) {
+		port = key_ports[i];
+		raw = base[(0x380 + port * 4) / 4];
+		ostd = base[(0x200 + port * 4) / 4];
+		p = append_text(p, "p");
+		p = append_number(p, port);
+		p = append_text(p, ":mmu");
+		*p++ = '0' + (raw & 1);
+		p = append_text(p, ",bank");
+		*p++ = '0' + ((raw >> 8) & 3);
+		p = append_text(p, ",ostd=0x");
+		p = append_hex32(p, ostd);
+		*p++ = ' ';
+	}
+	*p = 0;
+	log(line);
+}
+
+static void report_smi_common(void (*log)(const char *), unsigned long seconds,
+			      const char *name, volatile unsigned int *base)
+{
+	char line[192], *p;
+
+	if (!base)
+		return;
+	p = line;
+	p = append_text(p, "corot-smi: snap=");
+	p = append_number(p, seconds);
+	p = append_text(p, "s ");
+	p = append_text(p, name);
+	p = append_text(p, " l1len=0x");
+	p = append_hex32(p, base[0x100 / 4]);
+	p = append_text(p, " preultra=0x");
+	p = append_hex32(p, base[0x244 / 4]);
+	p = append_text(p, " dummy=0x");
+	p = append_hex32(p, base[0x444 / 4]);
+	*p = 0;
+	log(line);
+}
+
+static void report_smi_iommu(void (*log)(const char *), unsigned long seconds)
+{
+	char line[256], *p;
+	int active;
+
+	if (!smi_iommu)
+		return;
+	active = iommu_runtime_active();
+	p = line;
+	p = append_text(p, "corot-smi: snap=");
+	p = append_number(p, seconds);
+	p = append_text(p, "s iommu@1e802000 runtime=");
+	p = append_text(p, active == 1 ? "active" :
+			(active == 0 ? "suspended" : "unknown"));
+	if (active != 1) {
+		*p = 0;
+		log(line);
+		return;
+	}
+	p = append_text(p, " pt=0x");
+	p = append_hex32(p, smi_iommu[0x000 / 4]);
+	p = append_text(p, " ctrl=0x");
+	p = append_hex32(p, smi_iommu[0x110 / 4]);
+	p = append_text(p, " ivrp=0x");
+	p = append_hex32(p, smi_iommu[0x114 / 4]);
+	p = append_text(p, " int0=0x");
+	p = append_hex32(p, smi_iommu[0x120 / 4]);
+	p = append_text(p, " main=0x");
+	p = append_hex32(p, smi_iommu[0x124 / 4]);
+	p = append_text(p, " f0=0x");
+	p = append_hex32(p, smi_iommu[0x130 / 4]);
+	p = append_text(p, " f1=0x");
+	p = append_hex32(p, smi_iommu[0x134 / 4]);
+	*p = 0;
+	log(line);
+}
+
+static void report_smi_state(void (*log)(const char *), unsigned long seconds)
+{
+	static const unsigned long larb_pa[4] = {
+		0x1440c000UL, 0x1440d000UL, 0x1460c000UL, 0x1460d000UL,
+	};
+	static const char *const larb_name[4] = {
+		"larb0@1440c000", "larb1@1440d000",
+		"larb20@1460c000", "larb21@1460d000",
+	};
+	long mapping;
+	unsigned int i;
+
+	if (!smi_probe_initialized) {
+		smi_probe_initialized = 1;
+		smi_mem_fd = fb_sys(56, -100, (long)"/dev/mem", 2, 0);
+		if (smi_mem_fd < 0) {
+			log("corot-smi: /dev/mem unavailable\n");
+			return;
+		}
+		for (i = 0; i < 4; i++) {
+			mapping = map_smi_page(larb_pa[i]);
+			if (mapping < 0)
+				log_map_failure(log, larb_pa[i], mapping);
+			else
+				smi_larb[i] = (volatile unsigned int *)mapping;
+		}
+		mapping = map_smi_page(0x1e801000UL);
+		if (mapping < 0)
+			log_map_failure(log, 0x1e801000UL, mapping);
+		else
+			smi_common = (volatile unsigned int *)mapping;
+		mapping = map_smi_page(0x1440e000UL);
+		if (mapping < 0)
+			log_map_failure(log, 0x1440e000UL, mapping);
+		else
+			smi_subcomm = (volatile unsigned int *)mapping;
+		mapping = map_smi_page(0x1e802000UL);
+		if (mapping < 0)
+			log_map_failure(log, 0x1e802000UL, mapping);
+		else
+			smi_iommu = (volatile unsigned int *)mapping;
+	}
+	for (i = 0; i < 4; i++)
+		report_smi_larb(log, seconds, larb_name[i], smi_larb[i]);
+	report_smi_common(log, seconds, "common@1e801000", smi_common);
+	report_smi_common(log, seconds, "subcomm@1440e000", smi_subcomm);
+	report_smi_iommu(log, seconds);
+}
+
 static void detach_fb_console(void (*log)(const char *))
 {
 	char path[] = "/sys/class/vtconsole/vtcon0/name";
@@ -211,8 +447,10 @@ void corot_fb_test_step(void (*log)(const char *))
 	if (fb_sys(113, 1, (long)&now, 0, 0) || now.sec < next_tick)
 		return;
 	next_tick = now.sec + 5;
-	if (pin_snapshots++ < 3)
+	if (pin_snapshots++ < 3) {
 		report_display_pins(log, now.sec);
+		report_smi_state(log, now.sec);
+	}
 	if (fb_fd < 0) {
 		fb_fd = fb_sys(56, -100, (long)"/dev/fb0", 2, 0);
 		if (fb_fd < 0) {
